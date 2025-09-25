@@ -1,0 +1,168 @@
+# --- venafi_keystore_cache.py (pure stdlib) ---
+import json, time, base64, re, urllib.request
+from dataclasses import dataclass
+from typing import Dict, Optional, List
+
+# ---- equivalents to your Java types -----------------------------------------
+class CloudTlsException(RuntimeError):
+    pass
+
+@dataclass
+class CachedKeyStore:
+    """Holds a client private key + certificate chain + key password."""
+    private_key_pem: str
+    certificate_chain_pem: str  # end-entity followed by intermediates/root (if included)
+    key_password: str           # PKCS#8 encryption password (Kafka uses this)
+
+class KeyStoreCache:
+    def __init__(self, backing: Dict[str, CachedKeyStore]):
+        self._backing = dict(backing)
+
+    def get(self, alias: str) -> CachedKeyStore:
+        if alias not in self._backing:
+            raise KeyError(f"keystore alias not found: {alias}")
+        return self._backing[alias]
+
+# ---- resolver that mirrors your Java builder --------------------------------
+class VenafiKeystoreCacheResolver:
+    def __init__(self, venafi_uri: str, username: str, password: str, client_id: str, scope: str = "certificate:manage"):
+        self.venafi_uri = venafi_uri.rstrip("/")
+        self.username = username
+        self.password = password
+        self.client_id = client_id
+        self.scope = scope
+        self._certs: Dict[str, dict] = {}  # alias -> {policy_dn, cn, san_dns}
+
+    def add_certificate(self, alias: str, policy_dn: str, cn: Optional[str] = None, san_dns: Optional[List[str]] = None):
+        self._certs[alias] = {
+            "policy_dn": policy_dn,
+            "cn": cn or "deephaven-client",
+            "san_dns": list(san_dns or []),
+        }
+        return self
+
+    # --- HTTP helpers
+    def _post_json(self, path: str, body: dict, bearer: Optional[str] = None) -> dict:
+        url = f"{self.venafi_uri}{path}"
+        data = json.dumps(body).encode()
+        headers = {"Content-Type": "application/json"}
+        if bearer:
+            headers["Authorization"] = f"Bearer {bearer}"
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read().decode())
+
+    # --- Venafi flows
+    def _get_token(self) -> str:
+        out = self._post_json("/vedauth/authorize/oauth", {
+            "client_id": self.client_id,
+            "username": self.username,
+            "password": self.password,
+            "scope": self.scope,
+        })
+        tok = out.get("access_token")
+        if not tok:
+            raise CloudTlsException(f"OAuth failed: {out}")
+        return tok
+
+    def _request_certificate(self, bearer: str, policy_dn: str, cn: str, san_dns: List[str]) -> str:
+        san = [{"Type": 2, "Name": d} for d in san_dns] if san_dns else []
+        out = self._post_json("/vedsdk/Certificates/Request", {
+            "PolicyDN": policy_dn,
+            "Subject": cn,
+            "SubjectAltNames": san,
+            "WorkToDoTimeout": 60,  # try sync first
+        }, bearer=bearer)
+        cert_dn = out.get("CertificateDN")
+        if not cert_dn:
+            raise CloudTlsException(f"Request certificate failed: {out}")
+        return cert_dn
+
+    def _retrieve_pem_bundle(self, bearer: str, cert_dn: str, include_chain=True, include_priv=True,
+                             key_password: Optional[str] = None, tries=12, delay=5) -> CachedKeyStore:
+        if include_priv and not key_password:
+            key_password = "ChangeMe_12345!"  # replace with a strong secret from your vault
+
+        for _ in range(tries):
+            body = {
+                "CertificateDN": cert_dn,
+                "Format": "Base64 (PKCS #8)",   # returns Base64 that contains PKCS#8 private key + certs
+                "IncludeChain": bool(include_chain),
+                "RootFirstOrder": False,
+                "IncludePrivateKey": bool(include_priv),
+                "Password": key_password,
+                "WorkToDoTimeout": 0,
+            }
+            out = self._post_json("/vedsdk/Certificates/Retrieve", body, bearer=bearer)
+            b64 = out.get("CertificateData")
+            if not b64:
+                time.sleep(delay)
+                continue
+
+            pem = base64.b64decode(b64).decode("utf-8", errors="replace")
+            key_match = re.search(
+                r"-----BEGIN (ENCRYPTED )?PRIVATE KEY-----.*?-----END (ENCRYPTED )?PRIVATE KEY-----",
+                pem, flags=re.DOTALL)
+            certs = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, flags=re.DOTALL)
+
+            if not key_match or not certs:
+                raise CloudTlsException("PEM bundle missing key and/or certificates; check permissions/policy")
+
+            return CachedKeyStore(
+                private_key_pem=key_match.group(0),
+                certificate_chain_pem="\n".join(certs),
+                key_password=key_password or "",
+            )
+
+        raise CloudTlsException("Timed out waiting for certificate bundle; increase tries/delay or check workflow")
+
+    # --- public API (mirrors .resolveCache())
+    def resolve_cache(self) -> KeyStoreCache:
+        try:
+            bearer = self._get_token()
+            built: Dict[str, CachedKeyStore] = {}
+            for alias, cfg in self._certs.items():
+                cert_dn = self._request_certificate(bearer, cfg["policy_dn"], cfg["cn"], cfg["san_dns"])
+                cks = self._retrieve_pem_bundle(bearer, cert_dn)
+                built[alias] = cks
+            return KeyStoreCache(built)
+        except Exception as e:
+            raise CloudTlsException(str(e)) from e
+
+# ---- convenience function (mirrors your getKeyStoreCache()) ------------------
+def get_keystore_cache(venafi_uri: str, venafi_username: str, venafi_password: str,
+                       venafi_client_id: str, venafi_policy_path: str,
+                       alias: str = "default", max_retries: int = 3, backoff_sec: float = 3.0) -> CachedKeyStore:
+    for attempt in range(1, max_retries + 1):
+        try:
+            resolver = VenafiKeystoreCacheResolver(
+                venafi_uri, venafi_username, venafi_password, venafi_client_id
+            ).add_certificate(alias, venafi_policy_path)
+            cache = resolver.resolve_cache()
+            return cache.get(alias)
+        except CloudTlsException as e:
+            if attempt == max_retries:
+                raise
+            time.sleep(backoff_sec * attempt)
+
+
+
+
+# fill from your config
+venafiUri        = "https://tpp.mycompany.com"
+venafiUsername   = "my-user"
+venafiPassword   = "my-password"
+venafiClientId   = "my-oauth-client-id"
+venafiPolicyPath = r"\\VED\\Policy\\MyTeam\\KafkaClients"
+
+from venafi_keystore_cache import get_keystore_cache
+cks = get_keystore_cache(
+    venafi_uri=venafiUri,
+    venafi_username=venafiUsername,
+    venafi_password=venafiPassword,
+    venafi_client_id=venafiClientId,
+    venafi_policy_path=venafiPolicyPath,
+)
+
+# cks is your CachedKeyStore (private key + cert chain + password)
+print(cks.certificate_chain_pem.splitlines()[0])  # -----BEGIN CERTIFICATE-----
