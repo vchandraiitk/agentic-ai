@@ -166,3 +166,121 @@ cks = get_keystore_cache(
 
 # cks is your CachedKeyStore (private key + cert chain + password)
 print(cks.certificate_chain_pem.splitlines()[0])  # -----BEGIN CERTIFICATE-----
+
+
+
+
+
+# ====== EDIT THESE ======
+VENAFI_BASE   = "https://tpp.mycompany.com"
+CLIENT_ID     = "<oAuthClientId>"
+USERNAME      = "<username>"
+PASSWORD      = "<password>"
+POLICY_DN     = r"\\VED\\Policy\\MyTeam\\KafkaClients"  # your policyPath
+CN            = "deephaven-client"                      # subject CN; change if you need
+SAN_DNS       = []                                      # e.g. ["dh-client-1.company.com"]
+
+BOOTSTRAP     = "broker1:9093,broker2:9093"
+TOPIC         = "your.topic"
+SCHEMA_REG_URL = ""  # e.g. "https://schema-registry:8081" or leave ""
+
+# ====== Venafi helpers (stdlib only) ======
+import json, time, base64, re, urllib.request
+
+def _post_json(url, payload, bearer=None, timeout=120):
+    data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.getcode(), json.loads(resp.read().decode())
+
+def _get_token():
+    url = f"{VENAFI_BASE.rstrip('/')}/vedauth/authorize/oauth"
+    status, out = _post_json(url, {
+        "client_id": CLIENT_ID,
+        "username": USERNAME,
+        "password": PASSWORD,
+        "scope": "certificate:manage",
+    })
+    if status != 200 or "access_token" not in out:
+        raise RuntimeError(f"Venafi OAuth failed: {status} {out}")
+    return out["access_token"]
+
+def _request_certificate(token, policy_dn, cn, san_dns):
+    url = f"{VENAFI_BASE.rstrip('/')}/vedsdk/Certificates/Request"
+    san = [{"Type": 2, "Name": d} for d in san_dns] if san_dns else []
+    status, out = _post_json(url, {
+        "PolicyDN": policy_dn, "Subject": cn, "SubjectAltNames": san, "WorkToDoTimeout": 60
+    }, bearer=token)
+    cert_dn = out.get("CertificateDN")
+    if not cert_dn:
+        raise RuntimeError(f"Request cert failed: {status} {out}")
+    return cert_dn
+
+def _retrieve_pem_bundle(token, cert_dn, include_chain=True, include_priv=True, key_password=None, tries=12, delay=5):
+    if include_priv and not key_password:
+        key_password = "ChangeMe_12345!"  # replace with a real secret
+    url = f"{VENAFI_BASE.rstrip('/')}/vedsdk/Certificates/Retrieve"
+    for _ in range(tries):
+        body = {
+            "CertificateDN": cert_dn,
+            "Format": "Base64 (PKCS #8)",
+            "IncludeChain": bool(include_chain),
+            "RootFirstOrder": False,
+            "IncludePrivateKey": bool(include_priv),
+            "Password": key_password,
+            "WorkToDoTimeout": 0,
+        }
+        status, out = _post_json(url, body, bearer=token)
+        b64 = out.get("CertificateData")
+        if not b64:
+            time.sleep(delay); continue
+        pem = base64.b64decode(b64).decode("utf-8", errors="replace")
+        key_match = re.search(r"-----BEGIN (ENCRYPTED )?PRIVATE KEY-----.*?-----END (ENCRYPTED )?PRIVATE KEY-----",
+                              pem, flags=re.DOTALL)
+        certs = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", pem, flags=re.DOTALL)
+        if not key_match or not certs:
+            raise RuntimeError("PEM bundle missing key and/or certificates; check permissions/policy")
+        return key_match.group(0), "\n".join(certs), key_password
+    raise TimeoutError("Certificate not ready after polling.")
+
+# ====== Orchestrate Venafi issuance & build Kafka config ======
+token = _get_token()
+cert_dn = _request_certificate(token, POLICY_DN, CN, SAN_DNS)
+key_pem, chain_pem, key_pwd = _retrieve_pem_bundle(token, cert_dn)
+
+from deephaven.stream.kafka import consumer as kc
+from deephaven.stream.kafka.consumer import TableType, KeyValueSpec
+import deephaven.dtypes as dht
+
+KAFKA_CFG = {
+    "bootstrap.servers": BOOTSTRAP,
+    "security.protocol": "SSL",
+    "ssl.keystore.type": "PEM",
+    "ssl.keystore.certificate.chain": chain_pem,
+    "ssl.keystore.key": key_pem,
+    "ssl.key.password": key_pwd,
+}
+if SCHEMA_REG_URL:
+    KAFKA_CFG.update({
+        "schema.registry.url": SCHEMA_REG_URL,
+        "schema.registry.ssl.keystore.type": "PEM",
+        "schema.registry.ssl.keystore.certificate.chain": chain_pem,
+        "schema.registry.ssl.keystore.key": key_pem,
+        "schema.registry.ssl.key.password": key_pwd,
+    })
+
+# Example JSON mapping — change to your payload fields/types
+events = kc.consume(
+    KAFKA_CFG, TOPIC,
+    key_spec=KeyValueSpec.IGNORE,
+    value_spec=kc.json_spec({
+        "company_name": dht.string,
+        "currency": dht.string,
+        "account_number": dht.string,
+    }),
+    table_type=TableType.ring(2_000_000),
+)
+events
